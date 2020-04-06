@@ -1,49 +1,149 @@
-#!/bin/sh
-#
-# An example hook script to verify what is about to be committed.
-# Called by "git commit" with no arguments.  The hook should
-# exit with non-zero status after issuing an appropriate message if
-# it wants to stop the commit.
-#
-# To enable this hook, rename this file to "pre-commit".
+#!/usr/bin/env python
 
-if git rev-parse --verify HEAD >/dev/null 2>&1
-then
-	against=HEAD
-else
-	# Initial commit: diff against an empty tree object
-	against=$(git hash-object -t tree /dev/null)
-fi
+import json, urlparse, sys, os
+from BaseHTTPServer import BaseHTTPRequestHandler, HTTPServer
+from subprocess import call
 
-# If you want to allow non-ASCII filenames set this variable to true.
-allownonascii=$(git config --bool hooks.allownonascii)
+class GitAutoDeploy(BaseHTTPRequestHandler):
 
-# Redirect output to stderr.
-exec 1>&2
+    CONFIG_FILEPATH = './GitAutoDeploy.conf.json'
+    config = None
+    quiet = False
+    daemon = False
 
-# Cross platform projects tend to avoid non-ASCII filenames; prevent
-# them from being added to the repository. We exploit the fact that the
-# printable range starts at the space character and ends with tilde.
-if [ "$allownonascii" != "true" ] &&
-	# Note that the use of brackets around a tr range is ok here, (it's
-	# even required, for portability to Solaris 10's /usr/bin/tr), since
-	# the square bracket bytes happen to fall in the designated range.
-	test $(git diff --cached --name-only --diff-filter=A -z $against |
-	  LC_ALL=C tr -d '[ -~]\0' | wc -c) != 0
-then
-	cat <<\EOF
-Error: Attempt to add a non-ASCII file name.
+    @classmethod
+    def getConfig(myClass):
+        if(myClass.config == None):
+            try:
+                configString = open(myClass.CONFIG_FILEPATH).read()
+            except:
+                sys.exit('Could not load ' + myClass.CONFIG_FILEPATH + ' file')
 
-This can cause problems if you want to work with people on other platforms.
+            try:
+                myClass.config = json.loads(configString)
+            except:
+                sys.exit(myClass.CONFIG_FILEPATH + ' file is not valid json')
 
-To be portable it is advisable to rename the file.
+            for repository in myClass.config['repositories']:
+                if(not os.path.isdir(repository['path'])):
+                    sys.exit('Directory ' + repository['path'] + ' not found')
+                # Check for a repository with a local or a remote GIT_WORK_DIR
+                if not os.path.isdir(os.path.join(repository['path'], '.git')) \
+                   and not os.path.isdir(os.path.join(repository['path'], 'objects')):
+                    sys.exit('Directory ' + repository['path'] + ' is not a Git repository')
 
-If you know what you are doing you can disable this check using:
+        return myClass.config
 
-  git config hooks.allownonascii true
-EOF
-	exit 1
-fi
+    def do_POST(self):
+        event = self.headers.getheader('X-Github-Event')
+        if event == 'ping':
+            if not self.quiet:
+                print 'Ping event received'
+            self.respond(204)
+            return
+        if event != 'push':
+            if not self.quiet:
+                print 'We only handle ping and push events'
+            self.respond(304)
+            return
 
-# If there are whitespace errors, print the offending file names and fail.
-exec git diff-index --check --cached $against --
+        self.respond(204)
+
+        urls = self.parseRequest()
+        for url in urls:
+            paths = self.getMatchingPaths(url)
+            for path in paths:
+                self.fetch(path)
+                self.deploy(path)
+    print 'def parseRequest(self):'
+    def parseRequest(self):
+        length = int(self.headers.getheader('content-length'))
+        body = self.rfile.read(length)
+        payload = json.loads(body)
+        self.branch = payload['ref']
+        return [payload['repository']['url']]
+    print 'getMatchingPaths(self, repoUrl):'
+    def getMatchingPaths(self, repoUrl):
+        res = []
+        config = self.getConfig()
+        for repository in config['repositories']:
+            if(repository['url'] == repoUrl):
+                res.append(repository['path'])
+        return res
+    print 'def respond(self, code):'
+
+    def respond(self, code):
+        self.send_response(code)
+        self.send_header('Content-type', 'text/plain')
+        self.end_headers()
+
+    def fetch(self, path):
+        if(not self.quiet):
+            print "\nPost push request received"
+            print 'Updating ' + path
+        call(['cd "' + path + '" && git fetch'], shell=True)
+
+    def deploy(self, path):
+	print "def deploy(self, path):"
+
+        config = self.getConfig()
+        for repository in config['repositories']:
+            if(repository['path'] == path):
+                if 'deploy' in repository:
+                    branch = None
+                    if 'branch' in repository:
+			            print 'def deploy(self, path):%s' %(repository['branch'])
+                        branch = repository['branch']
+
+                    if branch is None or branch == self.branch:
+                        if(not self.quiet):
+                            print 'Executing deploy command'
+                        print 'start call(['cd "' + path + '" && ' + repository['deploy']], shell=True)'
+                        call(['cd "' + path + '" && ' + repository['deploy']], shell=True)
+                        print 'end call(['cd "' + path + '" && ' + repository['deploy']], shell=True)'
+                        
+                    elif not self.quiet:
+                        print 'Push to different branch (%s != %s), not deploying' % (branch, self.branch)
+                break
+
+def main():
+    try:
+        server = None
+        for arg in sys.argv: 
+            if(arg == '-d' or arg == '--daemon-mode'):
+                GitAutoDeploy.daemon = True
+                GitAutoDeploy.quiet = True
+            if(arg == '-q' or arg == '--quiet'):
+                GitAutoDeploy.quiet = True
+                
+        if(GitAutoDeploy.daemon):
+            pid = os.fork()
+            print 'os.fork()'
+            if(pid != 0):
+                print 'sys.exit()'
+                sys.exit()
+                
+            os.setsid()
+            print 'os.setsid()'
+
+        if(not GitAutoDeploy.quiet):
+            print 'Github Autodeploy Service v0.2 started'
+        else:
+            print 'Github Autodeploy Service v 0.2 started in daemon mode'
+             
+        server = HTTPServer(('', GitAutoDeploy.getConfig()['port']), GitAutoDeploy)
+        print 'server.serve_forever()'
+        server.serve_forever()
+    except (KeyboardInterrupt, SystemExit) as e:
+        if(e): # wtf, why is this creating a new line?
+            print >> sys.stderr, e
+            print 'run sys.stderr, e'
+
+        if(not server is None):
+            server.socket.close()
+
+        if(not GitAutoDeploy.quiet):
+            print 'Goodbye'
+
+if __name__ == '__main__':
+     main()
