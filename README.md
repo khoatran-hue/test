@@ -1,1 +1,0 @@
-## Firebase Phone Number Authentication
